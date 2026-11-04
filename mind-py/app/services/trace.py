@@ -45,6 +45,21 @@ class AgentTraceService:
         self.db.refresh(trace)
         return trace
 
+    def record_delivery_status(self, trace_id: int | None, status: str, detail: str = "") -> None:
+        if trace_id is None:
+            return
+        trace = self.db.get(AgentRunTrace, trace_id)
+        if trace is None:
+            return
+        try:
+            entries = json.loads(trace.agent_steps_json or "[]")
+        except (TypeError, json.JSONDecodeError):
+            entries = []
+        entries.append({"kind": "delivery_status", "status": status, "detail": detail[:500]})
+        trace.agent_steps_json = json.dumps(entries, ensure_ascii=False, default=str)
+        self.db.add(trace)
+        self.db.commit()
+
 
 def _json(value: Any) -> str:
     return json.dumps(_to_jsonable(value), ensure_ascii=False, default=str)
@@ -52,6 +67,15 @@ def _json(value: Any) -> str:
 
 def _agent_steps_with_collaboration(agent_run: AgentRunResult) -> list[Any]:
     entries: list[Any] = [*agent_run.steps]
+    entries.append(
+        {
+            "kind": "workflow_summary",
+            "workflowStatus": agent_run.workflow_status,
+            "latestFailureReason": agent_run.latest_failure_reason,
+            "revisionCount": agent_run.revision_count,
+            "usedDirectResponse": bool(agent_run.direct_response_text),
+        }
+    )
     entries.extend(
         {
             "kind": "agent_event",

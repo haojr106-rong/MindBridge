@@ -14,6 +14,7 @@ from app.agents.autonomous import (
     CoordinatorAgent,
     ResponseAgent,
     SafetyAgent,
+    STATIC_SAFETY_RESPONSE,
     UnderstandingAgent,
 )
 from app.agents.coordinator import EventDrivenCoordinator
@@ -91,7 +92,9 @@ class EventDrivenAgentRuntimeService:
         risk = self._select_risk(board)
         context = board.latest_artifact("context")
         risk_artifact = board.latest_artifact("risk")
-        accepted = board.accepted_artifact() or board.latest_artifact("response_proposal")
+        accepted = board.accepted_artifact()
+        if accepted is None and risk != RiskLevel.HIGH:
+            accepted = board.latest_artifact("response_proposal")
         memory_brief = "无相关历史记忆。"
         retrieved: list[SearchResult] = []
         response_messages: list[AiMessage] = []
@@ -103,6 +106,12 @@ class EventDrivenAgentRuntimeService:
         if not response_messages:
             response_messages = self._fallback_messages(intent, risk, user.display_name, board.model_input)
         assessment = risk_artifact.payload.get("assessment") if risk_artifact else None
+        workflow_status = board.workflow_status
+        direct_response_text = board.direct_response_text
+        if risk == RiskLevel.HIGH and accepted is None and not direct_response_text:
+            workflow_status = "FALLBACK_REJECTED"
+            direct_response_text = STATIC_SAFETY_RESPONSE
+            response_messages = []
         return AgentRunResult(
             intent=intent,
             risk_level=risk,
@@ -114,6 +123,10 @@ class EventDrivenAgentRuntimeService:
             collaboration_events=list(board.events),
             collaboration_tasks=list(board.tasks.values()),
             collaboration_artifacts=list(board.artifacts),
+            workflow_status=workflow_status,
+            latest_failure_reason=board.latest_failure_reason,
+            revision_count=board.revision_count,
+            direct_response_text=direct_response_text,
         )
 
     def _select_intent(self, board: CollaborationBlackboard) -> IntentType:

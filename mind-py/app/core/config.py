@@ -7,8 +7,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     agent_framework: str = "event_driven_multi_agent"
     agent_max_rounds: int = 8
-    agent_max_claims_per_round: int = 4
-    agent_max_claims_per_agent: int = 3
+    agent_max_understanding_runs: int = 1
+    agent_max_context_runs: int = 1
+    agent_max_response_runs: int = 3
+    agent_max_safety_runs: int = 5
+    agent_context_rag_timeout_seconds: float = 3.0
+    agent_context_summary_timeout_seconds: float = 3.0
     agent_final_acceptance_min_confidence: float = 0.6
     agent_model_default_provider: str = ""
     agent_model_default_model: str = ""
@@ -25,6 +29,7 @@ class Settings(BaseSettings):
     ai_provider: str = "ollama"
     ai_temperature: float = 0.35
     ai_max_tokens: int = 512
+    ai_final_retry_attempts: int = 1
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "mindbridge-qwen2.5-7b-ft:latest"
     finetuned_model_name: str = "mindbridge-qwen2.5-7b-ft:latest"

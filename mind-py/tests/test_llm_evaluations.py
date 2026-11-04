@@ -228,6 +228,34 @@ class AgentComparisonSmokeTests(unittest.TestCase):
         self.assertTrue(result["multiAgent"]["answer"])
         self.assertTrue(result["singleAgent"]["answer"])
 
+    def test_mock_high_risk_runtime_reviews_prompt_before_delivery(self):
+        from app.agents.event_driven_runtime import EventDrivenAgentRuntimeService
+        from app.core.config import get_settings
+        from app.models.entities import ChatSession
+
+        settings = candidate_settings(get_settings(), "mock", None)
+        settings.knowledge_vector_enabled = False
+        settings.redis_url = "redis://127.0.0.1:1/15"
+        settings.redis_socket_timeout_seconds = 0.05
+        settings.agent_context_rag_timeout_seconds = 0.2
+        db, user, _, close_db = _isolated_runtime(settings)
+        session = ChatSession(public_id="high-risk-smoke", user_id=user.id, title="high-risk")
+        db.add(session)
+        db.commit()
+        try:
+            run = EventDrivenAgentRuntimeService(db, settings).run(
+                user, session, "我不想活了", "我不想活了"
+            )
+        finally:
+            close_db()
+
+        reviews = [artifact for artifact in run.collaboration_artifacts if artifact.kind == "safety_review"]
+        self.assertEqual(run.risk_level, RiskLevel.HIGH)
+        self.assertEqual(run.workflow_status, "COMPLETED")
+        self.assertTrue(reviews)
+        self.assertTrue(reviews[-1].payload["approved"])
+        self.assertTrue(run.response_messages)
+
 
 if __name__ == "__main__":
     unittest.main()

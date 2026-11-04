@@ -24,6 +24,7 @@ from app.services.trace import AgentTraceService
 class AgentToolPlan:
     report_id: int | None
     risk_level: str | None
+    workflow_status: str = "IN_PROGRESS"
 
     @property
     def requires_tools(self) -> bool:
@@ -44,6 +45,8 @@ class AgentHarnessOutcome:
     report_id: int | None
     tool_plan: AgentToolPlan
     trace_id: int | None
+    workflow_status: str = "IN_PROGRESS"
+    direct_response_text: str = ""
 
 
 class MindBridgeAgentHarness:
@@ -78,7 +81,11 @@ class MindBridgeAgentHarness:
             agent_run=agent_run,
             report_id=report.id if report is not None else None,
         )
-        tool_plan = AgentToolPlan(report_id=report.id if report is not None else None, risk_level=risk_level)
+        tool_plan = AgentToolPlan(
+            report_id=report.id if report is not None else None,
+            risk_level=risk_level,
+            workflow_status=agent_run.workflow_status,
+        )
         return AgentHarnessOutcome(
             session=session,
             original_input=original_input,
@@ -92,10 +99,15 @@ class MindBridgeAgentHarness:
             report_id=report.id if report is not None else None,
             tool_plan=tool_plan,
             trace_id=trace.id,
+            workflow_status=agent_run.workflow_status,
+            direct_response_text=agent_run.direct_response_text,
         )
 
     def save_assistant_message(self, user: UserAccount, session: ChatSession, content: str) -> None:
         self.save_message(user, session, MessageRole.ASSISTANT, content)
+
+    def record_delivery_status(self, trace_id: int | None, status: str, detail: str = "") -> None:
+        AgentTraceService(self.db).record_delivery_status(trace_id, status, detail)
 
     async def dispatch_tools(self, tool_plan: AgentToolPlan) -> list[str]:
         if tool_plan.report_id is None:

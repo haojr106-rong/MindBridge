@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import uuid
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +37,41 @@ GENERAL_TASK_WORDS = [
     "前端", "后端", "项目", "接口", "bug", "报错", "作业", "论文", "翻译", "总结", "解释",
     "怎么写", "如何", "是什么", "为什么", "给我", "帮我", "推荐", "查询", "天气", "路线",
 ]
+
+_CONTEXT_SUMMARY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mindbridge-context-summary")
+_CONTEXT_RAG_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mindbridge-context-rag")
+
+HIGH_RISK_GUIDANCE_BLOCK = (
+    "安全指导：请明确询问用户当前是否安全、是否正处于可能伤害自己的紧急情况；"
+    "鼓励用户立即联系身边可信任的人陪伴，联系学校辅导员、心理中心或专业帮助；"
+    "如果存在立即危险，请联系当地紧急服务，并避免独处和接触可能造成伤害的物品。"
+)
+
+FINAL_FALLBACK_PROMPT = (
+    "这是经过预先审核的高风险兜底规则。先用简短、共情且不评判的语言回应；"
+    "必须询问用户当前是否安全；必须建议立即联系身边可信任的人并让对方陪伴；"
+    "必须建议寻求学校辅导员、心理中心或其他专业帮助；"
+    "如果用户处于紧急情况或有立即危险，必须建议联系当地紧急服务。"
+    "不得提供任何自伤、伤人或其他危险行为的操作细节。"
+)
+
+STATIC_SAFETY_RESPONSE = (
+    "我很在意你现在的安全。请先不要一个人承受，马上联系身边可信任的人陪着你，"
+    "并联系学校辅导员、心理中心或专业帮助。如果你正处于紧急情况或可能马上伤害自己，"
+    "请立即联系当地紧急服务，并尽量待在有人陪伴的安全地点。"
+)
+
+
+def high_risk_prompt_check(messages: list[AiMessage]) -> tuple[bool, list[str]]:
+    combined = "\n".join(getattr(message, "content", str(message)) for message in messages)
+    requirements = {
+        "缺少当前安全状态确认": ("当前安全", "是否安全", "立即危险"),
+        "缺少可信任的人指导": ("可信任的人", "信任的人", "有人陪伴"),
+        "缺少专业帮助指导": ("专业帮助", "心理中心", "辅导员", "咨询师"),
+        "缺少紧急求助指导": ("紧急服务", "紧急救助", "紧急情况", "立即联系"),
+    }
+    missing = [reason for reason, words in requirements.items() if not any(word in combined for word in words)]
+    return not missing, missing
 
 
 @dataclass
@@ -262,22 +299,24 @@ class SafetyAgent(BaseAutonomousAgent):
     def _review_response(self, task: AgentTask, board: CollaborationBlackboard, response: AgentArtifact) -> AgentTurnResult:
         risk = _risk_level(board)
         messages = response.payload.get("messages", [])
-        combined = "\n".join(getattr(message, "content", str(message)) for message in messages)
         approved = True
         reason = "response proposal satisfies current safety constraints"
-        if risk == RiskLevel.HIGH and not any(word in combined for word in ["高风险处理规则", "当前安全", "可信任的人", "紧急"]):
-            approved = False
-            reason = "high-risk response proposal lacks immediate safety guidance"
+        missing: list[str] = []
+        if risk == RiskLevel.HIGH:
+            approved, missing = high_risk_prompt_check(messages)
+            if not approved:
+                reason = "；".join(missing)
         payload = {
             "approved": approved,
             "reason": reason,
+            "missing": missing,
             "responseArtifactId": response.id,
+            "candidateAttempt": response.metadata.get("candidateAttempt", 1),
             "risk": risk.value,
             "privateMemoryKey": self.services.private_memory._key(self.name, self.services.session.public_id),
         }
-        kind = "safety_review" if approved else "critique"
+        kind = "safety_review"
         events = ()
-        follow_up_tasks = ()
         if not approved:
             events = (
                 AgentEvent(
@@ -288,21 +327,9 @@ class SafetyAgent(BaseAutonomousAgent):
                     message=reason,
                 ),
             )
-            follow_up_tasks = (
-                AgentTask(
-                    id=f"task:revise-response:{uuid.uuid4().hex[:8]}",
-                    title="Revise unsafe response proposal",
-                    description=reason,
-                    priority=TaskPriority.CRITICAL,
-                    required_capabilities=frozenset({AgentCapability.RESPONSE.value}),
-                    created_by=self.name,
-                    metadata={"kind": "response", "revisionOf": response.id},
-                ),
-            )
         self.remember(f"review approved={approved}; reason={reason}")
         return AgentTurnResult(
             artifacts=(self._artifact(kind, payload, task, 0.95, {"responseArtifactId": response.id}),),
-            tasks=follow_up_tasks,
             events=events,
         )
 
@@ -337,27 +364,59 @@ class ContextAgent(BaseAutonomousAgent):
 
         history = self._load_history()
         compacted_history, deterministic_brief = compact_history_for_prompt(history, self.services.settings, board.model_input)
-        memory_brief = self._summarize_memory(history, board.model_input, deterministic_brief)
+        memory_brief, summary_timed_out = self._memory_brief_with_timeout(
+            history, board.model_input, deterministic_brief
+        )
         model_history = self._bounded_model_history([*compacted_history, AiMessage(role="user", content=board.model_input)])
         intent = _intent(board)
         risk = _risk_level(board)
 
         retrieved: list["SearchResult"] = []
         query = ""
-        skill_context = ""
+        skill_context = MindBridgeSkillLibrary.response_skill_context(intent, risk, board.user_input)
+        rag_timed_out = False
+        rag_duration_ms = 0.0
         if intent != IntentType.CHAT or risk != RiskLevel.LOW:
-            query = self._rewrite_query(memory_brief, board.model_input)
-            retrieved = self.services.knowledge.retrieve(query, self.services.settings.knowledge_top_k)
-            skill_context = MindBridgeSkillLibrary.response_skill_context(intent, risk, board.user_input)
+            rag_started = time.perf_counter()
+            rag_future = _CONTEXT_RAG_EXECUTOR.submit(self._build_rag_context, memory_brief, board.model_input)
+            try:
+                query, retrieved = rag_future.result(
+                    timeout=float(getattr(self.services.settings, "agent_context_rag_timeout_seconds", 3.0))
+                )
+            except TimeoutError:
+                rag_timed_out = True
+                rag_future.cancel()
+            except Exception:
+                query, retrieved = board.model_input[:60], []
+            rag_duration_ms = (time.perf_counter() - rag_started) * 1000
         payload = {
             "memoryBrief": memory_brief,
             "modelHistory": model_history,
             "knowledgeQuery": query,
             "retrievedKnowledge": retrieved,
             "skillContext": skill_context,
+            "summaryTimedOut": summary_timed_out,
+            "ragTimedOut": rag_timed_out,
+            "ragDurationMs": round(rag_duration_ms, 3),
             "privateMemoryKey": self.services.private_memory._key(self.name, self.services.session.public_id),
         }
         self.remember(f"context intent={intent.value}; risk={risk.value}; retrieved={len(retrieved)}")
+        events: tuple[AgentEvent, ...] = ()
+        if rag_timed_out:
+            events = (
+                AgentEvent(
+                    type=AgentEventType.CONTEXT_TIMED_OUT,
+                    actor=self.name,
+                    task_id=task.id,
+                    message="RAG exceeded its deadline; Context keeps memoryBrief, modelHistory, and Skills",
+                    metadata={
+                        "stage": "RAG",
+                        "timeoutSeconds": float(getattr(self.services.settings, "agent_context_rag_timeout_seconds", 3.0)),
+                        "kept": ["memoryBrief", "modelHistory", "skillContext"],
+                        "omitted": ["retrievedKnowledge"],
+                    },
+                ),
+            )
         return AgentTurnResult(
             artifacts=(self._artifact("context", payload, task, 0.88),),
             messages=(
@@ -370,7 +429,42 @@ class ContextAgent(BaseAutonomousAgent):
                     content=f"context ready; retrieved={len(retrieved)}",
                 ),
             ),
+            events=events,
         )
+
+    def _memory_brief_with_timeout(
+        self,
+        history: list[AiMessage],
+        current_input: str,
+        fallback: str,
+    ) -> tuple[str, bool]:
+        if not history:
+            return "无相关历史记忆。", False
+        future = _CONTEXT_SUMMARY_EXECUTOR.submit(self._summarize_memory, history, current_input, fallback)
+        try:
+            return future.result(
+                timeout=float(getattr(self.services.settings, "agent_context_summary_timeout_seconds", 3.0))
+            ), False
+        except TimeoutError:
+            future.cancel()
+            return fallback or "无相关历史记忆。", True
+        except Exception:
+            return fallback or "无相关历史记忆。", False
+
+    def _build_rag_context(self, memory_brief: str, model_input: str) -> tuple[str, list["SearchResult"]]:
+        """Run query rewrite and retrieval as one deadline-bounded RAG stage."""
+        from sqlalchemy.orm import sessionmaker
+
+        from app.services.knowledge import KnowledgeService
+
+        query = self._rewrite_query(memory_brief, model_input)
+        bind = self.services.db.get_bind()
+        rag_db = sessionmaker(bind=bind)()
+        try:
+            knowledge = KnowledgeService(rag_db, self.services.settings)
+            return query, knowledge.retrieve(query, self.services.settings.knowledge_top_k)
+        finally:
+            rag_db.close()
 
     def _load_history(self) -> list[AiMessage]:
         from app.models.entities import ChatMessage
@@ -437,7 +531,7 @@ class ResponseAgent(BaseAutonomousAgent):
     )
 
     def decide(self, task: AgentTask, board: CollaborationBlackboard) -> AgentDecision:
-        if board.latest_artifact("response_proposal") and "revisionOf" not in task.metadata:
+        if board.latest_artifact("response_proposal") and int(task.metadata.get("candidateAttempt", 1)) <= int(board.latest_artifact("response_proposal").metadata.get("candidateAttempt", 1)):
             return AgentDecision(False, reason="response proposal already exists")
         if not board.latest_artifact("intent") or not board.latest_artifact("risk"):
             return AgentDecision(False, reason="response needs intent and risk artifacts")
@@ -497,6 +591,51 @@ class ResponseAgent(BaseAutonomousAgent):
                 *model_history,
             ]
             mode = "support"
+        attempt = int(task.metadata.get("candidateAttempt", 1))
+        last_failure_reason = str(task.metadata.get("lastFailureReason", ""))
+        program_events: list[AgentEvent] = []
+        used_program_fallback = False
+        used_model_supplement = False
+        if risk == RiskLevel.HIGH:
+            passed, missing = high_risk_prompt_check(messages)
+            if last_failure_reason or not passed:
+                supplement_request = "；".join(filter(None, [last_failure_reason, *missing]))
+                try:
+                    supplement = self.client().complete([
+                        AiMessage(
+                            role="system",
+                            content=(
+                                "你只负责补充高风险回复 Prompt 缺失的安全指导，不生成完整用户回复。"
+                                "补充内容必须包括失败原因要求的当前安全、可信任的人、专业帮助和紧急求助指导。"
+                            ),
+                        ),
+                        AiMessage(role="user", content=f"审查失败原因：{supplement_request}"),
+                    ]).strip()
+                except Exception:
+                    supplement = ""
+                if supplement:
+                    messages.append(AiMessage(role="system", content=f"定向修订补充：{supplement}"))
+                    used_model_supplement = True
+                passed, missing = high_risk_prompt_check(messages)
+                if not supplement or not passed:
+                    messages.append(AiMessage(role="system", content=HIGH_RISK_GUIDANCE_BLOCK))
+                    used_program_fallback = True
+                    passed, missing = high_risk_prompt_check(messages)
+            program_events.append(
+                AgentEvent(
+                    type=AgentEventType.PROGRAM_CHECKED,
+                    actor=self.name,
+                    task_id=task.id,
+                    message="high-risk prompt program check passed" if passed else "high-risk prompt program check failed",
+                    metadata={
+                        "candidateAttempt": attempt,
+                        "passed": passed,
+                        "missing": missing,
+                        "usedModelSupplement": used_model_supplement,
+                        "usedProgramFallback": used_program_fallback,
+                    },
+                )
+            )
         payload = {
             "messages": messages,
             "mode": mode,
@@ -504,10 +643,14 @@ class ResponseAgent(BaseAutonomousAgent):
             "risk": risk.value,
             "responseAgent": self.name,
             "privateMemoryKey": self.services.private_memory._key(self.name, self.services.session.public_id),
+            "candidateAttempt": attempt,
+            "lastFailureReason": last_failure_reason,
+            "usedModelSupplement": used_model_supplement,
+            "usedProgramFallback": used_program_fallback,
         }
         self.remember(f"response mode={mode}; intent={intent.value}; risk={risk.value}")
         return AgentTurnResult(
-            artifacts=(self._artifact("response_proposal", payload, task, 0.86),),
+            artifacts=(self._artifact("response_proposal", payload, task, 0.86, {"candidateAttempt": attempt}),),
             messages=(
                 AgentMessage(
                     id=f"msg:{uuid.uuid4().hex[:10]}",
@@ -518,6 +661,7 @@ class ResponseAgent(BaseAutonomousAgent):
                     content="请审查候选回复方案。",
                 ),
             ),
+            events=tuple(program_events),
         )
 
 
@@ -546,7 +690,7 @@ class CoordinatorAgent(BaseAutonomousAgent):
             description=board.user_input,
             priority=TaskPriority.CRITICAL if has_high_risk_signal(board.user_input) else TaskPriority.NORMAL,
             created_by=self.name,
-            metadata={"kind": "root"},
+            metadata={"kind": "root", "claimable": False},
         )
 
     def remember_acceptance(self, artifact_id: str, reason: str) -> None:

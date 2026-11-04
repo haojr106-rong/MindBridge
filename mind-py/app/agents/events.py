@@ -19,6 +19,10 @@ class AgentEventType(str, Enum):
     FINAL_ACCEPTED = "FINAL_ACCEPTED"
     ROUND_STARTED = "ROUND_STARTED"
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+    DEPENDENCY_BLOCKED = "DEPENDENCY_BLOCKED"
+    CONTEXT_TIMED_OUT = "CONTEXT_TIMED_OUT"
+    PROGRAM_CHECKED = "PROGRAM_CHECKED"
+    WORKFLOW_STATUS_CHANGED = "WORKFLOW_STATUS_CHANGED"
 
 
 class TaskStatus(str, Enum):
@@ -66,6 +70,9 @@ class AgentTask:
 
     def close(self) -> "AgentTask":
         return replace(self, status=TaskStatus.CLOSED)
+
+    def block(self) -> "AgentTask":
+        return replace(self, status=TaskStatus.BLOCKED)
 
 
 @dataclass(frozen=True)
@@ -129,6 +136,10 @@ class CollaborationBlackboard:
     artifacts: tuple[AgentArtifact, ...] = field(default_factory=tuple)
     events: tuple[AgentEvent, ...] = field(default_factory=tuple)
     final_artifact_id: str = ""
+    workflow_status: str = "IN_PROGRESS"
+    latest_failure_reason: str = ""
+    revision_count: int = 0
+    direct_response_text: str = ""
 
     def add_task(self, task: AgentTask) -> "CollaborationBlackboard":
         tasks = dict(self.tasks)
@@ -154,7 +165,10 @@ class CollaborationBlackboard:
 
     def add_artifact(self, artifact: AgentArtifact) -> "CollaborationBlackboard":
         event_type = AgentEventType.CRITIQUE_PUBLISHED if artifact.kind == "critique" else AgentEventType.ARTIFACT_PUBLISHED
-        return replace(self, artifacts=(*self.artifacts, artifact)).append_event(
+        artifacts = self.artifacts
+        if artifact.kind in {"response_proposal", "safety_review"}:
+            artifacts = tuple(item for item in artifacts if item.kind != artifact.kind)
+        return replace(self, artifacts=(*artifacts, artifact)).append_event(
             AgentEvent(
                 type=event_type,
                 actor=artifact.owner,
@@ -215,11 +229,22 @@ class CollaborationBlackboard:
         return next((artifact for artifact in self.artifacts if artifact.id == self.final_artifact_id), None)
 
     def accept_final(self, artifact_id: str, actor: str, reason: str) -> "CollaborationBlackboard":
-        return replace(self, final_artifact_id=artifact_id).append_event(
+        status = "FALLBACK_COMPLETED" if self.latest_artifact("response_proposal") and self.latest_artifact("response_proposal").metadata.get("fallback") else "COMPLETED"
+        board = replace(self, final_artifact_id=artifact_id, workflow_status=status)
+        board = board.append_event(
             AgentEvent(
                 type=AgentEventType.FINAL_ACCEPTED,
                 actor=actor,
                 artifact_id=artifact_id,
                 message=reason,
+            )
+        )
+        return board.append_event(
+            AgentEvent(
+                type=AgentEventType.WORKFLOW_STATUS_CHANGED,
+                actor=actor,
+                artifact_id=artifact_id,
+                message=status,
+                metadata={"status": status},
             )
         )

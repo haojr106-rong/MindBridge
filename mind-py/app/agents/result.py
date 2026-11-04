@@ -29,6 +29,10 @@ class AgentRunResult:
     collaboration_events: list[Any] = field(default_factory=list)
     collaboration_tasks: list[Any] = field(default_factory=list)
     collaboration_artifacts: list[Any] = field(default_factory=list)
+    workflow_status: str = "IN_PROGRESS"
+    latest_failure_reason: str = ""
+    revision_count: int = 0
+    direct_response_text: str = ""
 
     @property
     def requires_report(self) -> bool:
