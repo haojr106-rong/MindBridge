@@ -1,0 +1,10 @@
+Couldn't find 'C:\Users\Hjr20\.ollama\id_ed25519'. Generating new private key.
+Your new public key is: 
+
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINE8CHakFI2GQFtNlvUkyLFAXmuaBDmd0yGYdM+5hSSI
+
+[GIN] 2026/11/04 - 12:12:07 | 200 |  62.28ms |       127.0.0.1 | GET      "/api/tags"
+[GIN] 2026/11/04 - 12:12:12 | 200 |  15.29ms |       127.0.0.1 | GET      "/api/tags"
+[GIN] 2026/11/04 - 12:12:16 | 200 |  19.95ms |       127.0.0.1 | GET      "/api/tags"
+[GIN] 2026/11/04 - 12:12:18 | 200 |   9.09ms |       127.0.0.1 | GET      "/api/tags"
+[GIN] 2026/11/04 - 12:12:36 | 200 |  10.16ms |       127.0.0.1 | GET      "/api/tags"
