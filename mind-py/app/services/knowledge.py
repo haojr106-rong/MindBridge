@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import math
 import re
+import threading
+import weakref
 from dataclasses import dataclass
-from typing import Hashable
+from datetime import datetime
+from typing import Hashable, Iterable
 
 from pypdf import PdfReader
+from sqlalchemy import func
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -33,11 +39,190 @@ class RetrievalCandidate:
     bm25_score: float = 0.0
 
 
+@dataclass(frozen=True)
+class KnowledgeCorpusSignature:
+    """Cheap corpus version used to invalidate process-local search indexes."""
+
+    chunk_count: int
+    max_chunk_id: int
+    latest_created_at: datetime | None
+
+
+class Bm25InvertedIndex:
+    """Thread-safe BM25 index shared by services using one database engine.
+
+    Tokenization, document lengths and document frequencies are computed when
+    the corpus changes. Queries only visit postings for tokens in the query.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._document_terms: dict[int, tuple[str, ...]] = {}
+        self._document_lengths: dict[int, int] = {}
+        self._document_sources: dict[int, str] = {}
+        self._source_documents: dict[str, set[int]] = {}
+        self._postings: dict[str, dict[int, int]] = {}
+        self._total_document_length = 0
+        self._signature: KnowledgeCorpusSignature | None = None
+
+    @property
+    def ready(self) -> bool:
+        with self._lock:
+            return self._signature is not None
+
+    def matches(self, signature: KnowledgeCorpusSignature) -> bool:
+        with self._lock:
+            return self._signature == signature
+
+    def rebuild(
+        self,
+        chunks: Iterable[KnowledgeChunk],
+        signature: KnowledgeCorpusSignature,
+    ) -> None:
+        with self._lock:
+            self._document_terms.clear()
+            self._document_lengths.clear()
+            self._document_sources.clear()
+            self._source_documents.clear()
+            self._postings.clear()
+            self._total_document_length = 0
+            for chunk in chunks:
+                self._add_chunk(chunk)
+            self._signature = signature
+
+    def replace_source(
+        self,
+        source: str,
+        chunks: Iterable[KnowledgeChunk],
+        signature: KnowledgeCorpusSignature,
+    ) -> None:
+        with self._lock:
+            for chunk_id in tuple(self._source_documents.get(source, ())):
+                self._remove_chunk(chunk_id)
+            for chunk in chunks:
+                self._add_chunk(chunk)
+            self._signature = signature
+
+    def search(self, query: str, top_k: int) -> list[tuple[int, float]]:
+        query_terms = counts(tokenize(query))
+        if not query_terms or top_k <= 0:
+            return []
+        with self._lock:
+            total_documents = len(self._document_lengths)
+            if total_documents == 0:
+                return []
+            average_length = self._total_document_length / total_documents or 1.0
+            candidate_ids: set[int] = set()
+            term_statistics: list[tuple[dict[int, int], float, float]] = []
+            for term, query_frequency in query_terms.items():
+                posting = self._postings.get(term)
+                if not posting:
+                    continue
+                candidate_ids.update(posting)
+                document_frequency = len(posting)
+                inverse_document_frequency = math.log(
+                    1.0
+                    + (total_documents - document_frequency + 0.5)
+                    / (document_frequency + 0.5)
+                )
+                term_statistics.append(
+                    (posting, inverse_document_frequency, 1.0 + math.log(query_frequency))
+                )
+
+            k1 = 1.5
+            b = 0.75
+            scores: list[tuple[int, float]] = []
+            for chunk_id in candidate_ids:
+                document_length = self._document_lengths[chunk_id]
+                length_norm = k1 * (1.0 - b + b * document_length / average_length)
+                score = 0.0
+                for posting, inverse_document_frequency, query_boost in term_statistics:
+                    term_frequency = posting.get(chunk_id, 0)
+                    if term_frequency == 0:
+                        continue
+                    score += (
+                        inverse_document_frequency
+                        * query_boost
+                        * (term_frequency * (k1 + 1.0))
+                        / (term_frequency + length_norm)
+                    )
+                if score > 0:
+                    scores.append((chunk_id, score))
+            return heapq.nlargest(top_k, scores, key=lambda item: (item[1], -item[0]))
+
+    def statistics(self) -> dict[str, int | float | bool]:
+        with self._lock:
+            document_count = len(self._document_lengths)
+            return {
+                "ready": self._signature is not None,
+                "documents": document_count,
+                "terms": len(self._postings),
+                "postings": sum(len(posting) for posting in self._postings.values()),
+                "averageDocumentLength": round(
+                    self._total_document_length / document_count if document_count else 0.0,
+                    3,
+                ),
+            }
+
+    def _add_chunk(self, chunk: KnowledgeChunk) -> None:
+        if chunk.id is None:
+            return
+        chunk_id = int(chunk.id)
+        if chunk_id in self._document_lengths:
+            self._remove_chunk(chunk_id)
+        term_frequencies = counts(tokenize(chunk.content))
+        document_length = sum(term_frequencies.values())
+        self._document_terms[chunk_id] = tuple(term_frequencies)
+        self._document_lengths[chunk_id] = document_length
+        self._document_sources[chunk_id] = chunk.source
+        self._source_documents.setdefault(chunk.source, set()).add(chunk_id)
+        self._total_document_length += document_length
+        for term, frequency in term_frequencies.items():
+            self._postings.setdefault(term, {})[chunk_id] = frequency
+
+    def _remove_chunk(self, chunk_id: int) -> None:
+        document_terms = self._document_terms.pop(chunk_id, ())
+        self._total_document_length -= self._document_lengths.pop(chunk_id, 0)
+        source = self._document_sources.pop(chunk_id, "")
+        source_documents = self._source_documents.get(source)
+        if source_documents is not None:
+            source_documents.discard(chunk_id)
+            if not source_documents:
+                self._source_documents.pop(source, None)
+        for term in document_terms:
+            posting = self._postings.get(term)
+            if posting is None:
+                continue
+            posting.pop(chunk_id, None)
+            if not posting:
+                self._postings.pop(term, None)
+
+
+_BM25_REGISTRY_LOCK = threading.RLock()
+_BM25_INDEXES: "weakref.WeakKeyDictionary[Engine, Bm25InvertedIndex]" = weakref.WeakKeyDictionary()
+
+
+def _engine_for_session(db: Session) -> Engine:
+    bind = db.get_bind()
+    return bind.engine if isinstance(bind, Connection) else bind
+
+
+def _shared_bm25_index(db: Session) -> Bm25InvertedIndex:
+    engine = _engine_for_session(db)
+    with _BM25_REGISTRY_LOCK:
+        index = _BM25_INDEXES.get(engine)
+        if index is None:
+            index = Bm25InvertedIndex()
+            _BM25_INDEXES[engine] = index
+        return index
+
+
 class KnowledgeService:
     def __init__(self, db: Session, settings: Settings):
         self.db = db
         self.settings = settings
         self.vector_store = ChromaKnowledgeStore(settings)
+        self.bm25_index = _shared_bm25_index(db)
 
     def count(self) -> int:
         return self.db.query(KnowledgeChunk).count()
@@ -52,6 +237,7 @@ class KnowledgeService:
             .all()
         ]
         if existing == chunks:
+            self.warm_bm25_index()
             return len(existing)
         return self.ingest(source, content)
 
@@ -83,6 +269,7 @@ class KnowledgeService:
             "hybridVectorWeight": self.settings.knowledge_hybrid_vector_weight,
             "hybridBm25Weight": self.settings.knowledge_hybrid_bm25_weight,
             "rerankEnabled": self.settings.knowledge_rerank_enabled,
+            "bm25Index": self.bm25_index.statistics(),
             "vectorError": vector_error,
         }
 
@@ -103,6 +290,7 @@ class KnowledgeService:
         return snapshot
 
     def ingest(self, source: str, content: str) -> int:
+        previous_signature = self._bm25_signature()
         chunks = chunk_text(content, self.settings.knowledge_chunk_size, self.settings.knowledge_chunk_overlap)
         self._delete_vector_source(source)
         self.db.query(KnowledgeChunk).filter(KnowledgeChunk.source == source).delete()
@@ -114,7 +302,23 @@ class KnowledgeService:
         self.db.flush()
         self._index_vector_chunks(rows)
         self.db.commit()
+        committed_rows = (
+            self.db.query(KnowledgeChunk)
+            .filter(KnowledgeChunk.source == source)
+            .order_by(KnowledgeChunk.source_index.asc())
+            .all()
+        )
+        signature = self._bm25_signature()
+        if self.bm25_index.matches(previous_signature):
+            self.bm25_index.replace_source(source, committed_rows, signature)
+        else:
+            self._rebuild_bm25_index(signature)
         return len(chunks)
+
+    def warm_bm25_index(self) -> dict[str, int | float | bool]:
+        """Build or refresh the process-local BM25 index when the corpus changed."""
+        self._ensure_bm25_index()
+        return self.bm25_index.statistics()
 
     def ingest_file(self, filename: str, data: bytes) -> int:
         lower = filename.lower()
@@ -127,26 +331,61 @@ class KnowledgeService:
     def retrieve(self, query: str, top_k: int | None = None) -> list[SearchResult]:
         top_k = top_k or self.settings.knowledge_top_k
         candidate_k = self._candidate_k(top_k)
-        chunks = self.db.query(KnowledgeChunk).all()
         # Primary retrieval now uses hybrid recall: semantic vector candidates
         # plus BM25 keyword candidates, followed by deterministic local rerank.
         vector_results = self._retrieve_vector(query, candidate_k)
-        bm25_results = self._retrieve_bm25(query, candidate_k, chunks)
+        bm25_results = self._retrieve_bm25(query, candidate_k)
         ranked = self._fuse_and_rerank(query, vector_results, bm25_results, top_k)
         if ranked:
             return self._expand_best(ranked, top_k)
         return []
 
     def _retrieve_bm25(self, query: str, top_k: int, chunks: list[KnowledgeChunk] | None = None) -> list[SearchResult]:
-        chunks = chunks if chunks is not None else self.db.query(KnowledgeChunk).all()
-        scores = bm25_scores(query, chunks)
-        ranked = [
-            SearchResult(chunk.id, chunk.source, chunk.content, scores.get(chunk.id, 0.0))
-            for chunk in chunks
-            if chunk.id is not None and scores.get(chunk.id, 0.0) > 0
+        # Preserve the explicit chunk-list path for isolated one-shot callers.
+        if chunks is not None:
+            scores = bm25_scores(query, chunks)
+            ranked = [
+                SearchResult(chunk.id, chunk.source, chunk.content, scores.get(chunk.id, 0.0))
+                for chunk in chunks
+                if chunk.id is not None and scores.get(chunk.id, 0.0) > 0
+            ]
+            ranked.sort(key=lambda item: item.score, reverse=True)
+            return ranked[:top_k]
+
+        self._ensure_bm25_index()
+        scored_ids = self.bm25_index.search(query, top_k)
+        if not scored_ids:
+            return []
+        chunk_ids = [chunk_id for chunk_id, _ in scored_ids]
+        rows = self.db.query(KnowledgeChunk).filter(KnowledgeChunk.id.in_(chunk_ids)).all()
+        chunks_by_id = {int(chunk.id): chunk for chunk in rows if chunk.id is not None}
+        return [
+            SearchResult(chunk_id, chunks_by_id[chunk_id].source, chunks_by_id[chunk_id].content, score)
+            for chunk_id, score in scored_ids
+            if chunk_id in chunks_by_id
         ]
-        ranked.sort(key=lambda item: item.score, reverse=True)
-        return ranked[:top_k]
+
+    def _ensure_bm25_index(self) -> None:
+        signature = self._bm25_signature()
+        if self.bm25_index.matches(signature):
+            return
+        self._rebuild_bm25_index(signature)
+
+    def _rebuild_bm25_index(self, signature: KnowledgeCorpusSignature | None = None) -> None:
+        chunks = self.db.query(KnowledgeChunk).order_by(KnowledgeChunk.id.asc()).all()
+        self.bm25_index.rebuild(chunks, signature or self._bm25_signature())
+
+    def _bm25_signature(self) -> KnowledgeCorpusSignature:
+        chunk_count, max_chunk_id, latest_created_at = self.db.query(
+            func.count(KnowledgeChunk.id),
+            func.max(KnowledgeChunk.id),
+            func.max(KnowledgeChunk.created_at),
+        ).one()
+        return KnowledgeCorpusSignature(
+            chunk_count=int(chunk_count or 0),
+            max_chunk_id=int(max_chunk_id or 0),
+            latest_created_at=latest_created_at,
+        )
 
     def _fuse_and_rerank(
         self,

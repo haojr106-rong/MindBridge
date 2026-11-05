@@ -134,6 +134,8 @@ mindbridge-qwen2.5-7b-ft:latest
 
 知识库默认优先使用 Chroma 持久化向量库，embedding 由 OpenAI `text-embedding-3-small` 提供。查询时会同时取向量候选和 BM25 候选，按配置权重融合后进入本地 reranker。没有 `OPENAI_API_KEY`、缺少 `chromadb` 或向量调用失败时，会回退到本地 BM25 + `hybrid_score` reranker：
 
+BM25 使用进程内共享的倒排索引。知识入库或来源更新时预计算每个 Chunk 的 Token 词频、文档长度、文档频率和 Posting；查询时只访问命中 Query Token 的 Chunk，不再重新分词并扫描整个知识库。每次查询会用数据库中的 Chunk 数量、最大 ID 和最新创建时间进行轻量版本校验，多进程或外部入库导致版本变化时会自动重建当前进程的索引。管理员知识库状态响应中的 `bm25Index` 会显示索引是否就绪、文档数、词项数、Posting 数和平均文档长度。
+
 ```env
 OPENAI_API_KEY=你的_API_Key
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
