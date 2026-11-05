@@ -34,3 +34,4 @@ def seed_data(db: Session) -> None:
     root = Path(__file__).resolve().parents[1]
     for file in sorted((root / "knowledge").glob("*.md")):
         service.ensure_source(file.name, file.read_text(encoding="utf-8"))
+    service.ensure_search_index()

@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     knowledge_rerank_enabled: bool = True
     knowledge_vector_enabled: bool = True
     knowledge_vector_required: bool = False
+    knowledge_search_enabled: bool = True
+    knowledge_search_required: bool = False
+    opensearch_url: str = "http://127.0.0.1:19200"
+    opensearch_index: str = "mindbridge_knowledge_chunks"
+    opensearch_username: str = ""
+    opensearch_password: str = ""
+    opensearch_verify_certs: bool = False
+    opensearch_timeout_seconds: float = 2.0
     chroma_persist_dir: str = "data/chroma"
     chroma_collection_name: str = "mindbridge_knowledge"
     chroma_snapshot_dir: str = "data/chroma-snapshots"

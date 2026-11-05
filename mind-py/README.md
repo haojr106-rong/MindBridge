@@ -11,7 +11,7 @@ Web 框架：FastAPI
 配置管理：pydantic-settings，.env
 AI 接入：Ollama，本地微调 GGUF 模型，OpenAI-compatible API，Mock Provider
 Agent 编排：事件驱动黑板协作 runtime
-RAG：本地知识库切块、OpenAI Embeddings、Chroma 向量库、BM25、分数融合、本地 reranker、上下文扩展
+RAG：本地知识库切块、Embedding、Chroma 向量库、OpenSearch BM25、混合召回、本地 reranker、上下文扩展
 流式输出：Server-Sent Events
 文档解析：pypdf
 Excel 台账：openpyxl
@@ -21,7 +21,7 @@ Excel 台账：openpyxl
 工具协议：MCP
 ```
 
-说明：当前 Python 版只保留事件驱动多 Agent runtime，入口在 `app/agents/event_driven_runtime.py`。共享返回类型定义在 `app/agents/result.py`。RAG 默认使用 Chroma 本地持久化向量库做语义召回，同时用 BM25 做关键词召回，再融合并本地 rerank；未安装 Chroma、未配置 `OPENAI_API_KEY` 或向量服务异常时，会自动回退到本地 BM25 + `hybrid_score` reranker，避免演示环境中断。
+说明：当前 Python 版只保留事件驱动多 Agent runtime，入口在 `app/agents/event_driven_runtime.py`。共享返回类型定义在 `app/agents/result.py`。RAG 使用 Chroma 做语义召回、OpenSearch BM25 做持久化关键词召回，再融合并本地 rerank；任一外部检索服务异常时会使用仍可用的路线，OpenSearch 不可用时自动回退到进程内 BM25。
 
 ## 目录结构
 
@@ -114,6 +114,7 @@ REDIS_MEMORY_MAX_MESSAGES=40
 
 - `mysql`：MySQL 8.4，容器内端口 `3306`，宿主机映射 `13306`
 - `redis`：Redis 7，容器内端口 `6379`，宿主机映射 `16379`
+- `opensearch`：持久化BM25关键词索引，宿主机映射 `19200`，数据绑定到 `./data/opensearch`
 - `app`：MindBridge FastAPI 服务，宿主机端口 `8080`
 
 默认配置会让应用容器访问宿主机 Ollama：
@@ -132,15 +133,20 @@ mindbridge-qwen2.5-7b-ft:latest
 
 应用启动时会同步 `app/knowledge/*.md` 内置默认知识库到数据库。当前默认文档覆盖校园心理支持总则、风险等级策略、焦虑恐慌、情绪低落、睡眠作息、学业压力、考试季、人际关系、新生适应、咨询转介和隐私边界等主题；如果默认 md 内容发生变化，重启后对应来源会按当前切块规则刷新入库。
 
-知识库默认优先使用 Chroma 持久化向量库，embedding 由 OpenAI `text-embedding-3-small` 提供。查询时会同时取向量候选和 BM25 候选，按配置权重融合后进入本地 reranker。没有 `OPENAI_API_KEY`、缺少 `chromadb` 或向量调用失败时，会回退到本地 BM25 + `hybrid_score` reranker：
+知识库使用 Chroma 持久化向量库和OpenSearch BM25双路召回，按配置权重融合后进入本地reranker。OpenSearch保存中文CJK分词结果、倒排表和BM25统计，避免大型知识库在每个Python进程中复制完整索引。OpenSearch不可用时才启用原有进程内BM25索引作为降级路线。
 
-BM25 使用进程内共享的倒排索引。知识入库或来源更新时预计算每个 Chunk 的 Token 词频、文档长度、文档频率和 Posting；查询时只访问命中 Query Token 的 Chunk，不再重新分词并扫描整个知识库。每次查询会用数据库中的 Chunk 数量、最大 ID 和最新创建时间进行轻量版本校验，多进程或外部入库导致版本变化时会自动重建当前进程的索引。管理员知识库状态响应中的 `bm25Index` 会显示索引是否就绪、文档数、词项数、Posting 数和平均文档长度。
+应用启动时会比较MySQL与OpenSearch中的知识块数量和最大ID；不一致时从MySQL重建OpenSearch派生索引。知识入库后同步替换对应来源的OpenSearch文档。管理员状态响应中的 `keywordSearch` 显示OpenSearch可用性、索引名、文档数和错误信息；`bm25Index` 显示本地降级索引状态。
 
 ```env
 OPENAI_API_KEY=你的_API_Key
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 KNOWLEDGE_VECTOR_ENABLED=true
 KNOWLEDGE_VECTOR_REQUIRED=false
+KNOWLEDGE_SEARCH_ENABLED=true
+KNOWLEDGE_SEARCH_REQUIRED=false
+OPENSEARCH_URL=http://127.0.0.1:19200
+OPENSEARCH_INDEX=mindbridge_knowledge_chunks
+OPENSEARCH_TIMEOUT_SECONDS=2
 KNOWLEDGE_CANDIDATE_K=16
 KNOWLEDGE_HYBRID_VECTOR_WEIGHT=0.65
 KNOWLEDGE_HYBRID_BM25_WEIGHT=0.35
@@ -154,10 +160,11 @@ CHROMA_SNAPSHOT_DIR=data/chroma-snapshots
 ```bash
 curl -u admin:admin123 http://127.0.0.1:8080/api/admin/knowledge/status
 curl -u admin:admin123 -X POST http://127.0.0.1:8080/api/admin/knowledge/rebuild-vector
+curl -u admin:admin123 -X POST http://127.0.0.1:8080/api/admin/knowledge/rebuild-search
 curl -u admin:admin123 -X POST http://127.0.0.1:8080/api/admin/knowledge/backup
 ```
 
-当 `KNOWLEDGE_VECTOR_REQUIRED=false` 时，如果 Chroma 或 embedding 服务不可用，系统会降级到本地 BM25 + 词面 rerank；设为 `true` 则启动或检索失败时直接暴露错误。
+`KNOWLEDGE_SEARCH_REQUIRED=false` 时OpenSearch故障会自动回退到本地BM25；设为 `true` 时索引或查询失败会直接暴露错误。`KNOWLEDGE_VECTOR_REQUIRED=false` 时Chroma或Embedding故障不会阻断BM25检索。
 
 ## 工具队列、限流与死信
 

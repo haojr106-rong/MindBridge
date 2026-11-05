@@ -8,5 +8,12 @@ data/*.db
 data/*.sqlite
 data/*.xlsx
 data/chroma/
+data/opensearch/
+data/downloads/
+data/runtime/
+data/java-runtime/
+data/pip-cache/
+data/tmp/
+data/docker-start.*.log
 target/
 .DS_Store

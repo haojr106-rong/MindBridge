@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.models.entities import KnowledgeChunk
+from app.services.search_store import OpenSearchKnowledgeStore
 from app.services.vector_store import FALLBACK_RETRIEVAL_LABEL, PRIMARY_RETRIEVAL_LABEL, ChromaKnowledgeStore
 
 
@@ -222,6 +223,7 @@ class KnowledgeService:
         self.db = db
         self.settings = settings
         self.vector_store = ChromaKnowledgeStore(settings)
+        self.search_store = OpenSearchKnowledgeStore(settings)
         self.bm25_index = _shared_bm25_index(db)
 
     def count(self) -> int:
@@ -252,7 +254,8 @@ class KnowledgeService:
         return {
             "retrievalOrder": [
                 PRIMARY_RETRIEVAL_LABEL,
-                f"{FALLBACK_RETRIEVAL_LABEL} when OPENAI_API_KEY/chromadb/vector call is unavailable",
+                "OpenSearch BM25 keyword retrieval",
+                f"{FALLBACK_RETRIEVAL_LABEL} when vector/OpenSearch retrieval is unavailable",
             ],
             "primaryRetrieval": PRIMARY_RETRIEVAL_LABEL,
             "fallbackRetrieval": FALLBACK_RETRIEVAL_LABEL,
@@ -269,6 +272,7 @@ class KnowledgeService:
             "hybridVectorWeight": self.settings.knowledge_hybrid_vector_weight,
             "hybridBm25Weight": self.settings.knowledge_hybrid_bm25_weight,
             "rerankEnabled": self.settings.knowledge_rerank_enabled,
+            "keywordSearch": self.search_store.statistics(),
             "bm25Index": self.bm25_index.statistics(),
             "vectorError": vector_error,
         }
@@ -313,12 +317,39 @@ class KnowledgeService:
             self.bm25_index.replace_source(source, committed_rows, signature)
         else:
             self._rebuild_bm25_index(signature)
+        self._sync_search_source(source, committed_rows)
         return len(chunks)
 
     def warm_bm25_index(self) -> dict[str, int | float | bool]:
         """Build or refresh the process-local BM25 index when the corpus changed."""
         self._ensure_bm25_index()
         return self.bm25_index.statistics()
+
+    def ensure_search_index(self) -> dict[str, object]:
+        """Create/rebuild the persistent BM25 projection when it is stale."""
+        if not self.search_store.enabled:
+            return self.search_store.statistics()
+        try:
+            if not self.search_store.available:
+                raise RuntimeError(self.search_store.error or "OpenSearch is unavailable")
+            database_signature = self._bm25_signature()
+            search_signature = self.search_store.corpus_signature()
+            expected = (database_signature.chunk_count, database_signature.max_chunk_id)
+            if search_signature != expected:
+                rows = self.db.query(KnowledgeChunk).order_by(KnowledgeChunk.id.asc()).all()
+                self.search_store.rebuild(rows)
+            return self.search_store.statistics()
+        except Exception as exc:
+            self._handle_search_error("ensure_index", exc)
+            return self.search_store.statistics()
+
+    def rebuild_search_index(self) -> int:
+        rows = self.db.query(KnowledgeChunk).order_by(KnowledgeChunk.id.asc()).all()
+        try:
+            return self.search_store.rebuild(rows)
+        except Exception as exc:
+            self._handle_search_error("rebuild", exc)
+            return 0
 
     def ingest_file(self, filename: str, data: bytes) -> int:
         lower = filename.lower()
@@ -351,6 +382,15 @@ class KnowledgeService:
             ]
             ranked.sort(key=lambda item: item.score, reverse=True)
             return ranked[:top_k]
+
+        if self.search_store.enabled:
+            try:
+                return [
+                    SearchResult(hit.chunk_id, hit.source, hit.content, hit.score)
+                    for hit in self.search_store.search(query, top_k)
+                ]
+            except Exception as exc:
+                self._handle_search_error("retrieve", exc)
 
         self._ensure_bm25_index()
         scored_ids = self.bm25_index.search(query, top_k)
@@ -536,6 +576,28 @@ class KnowledgeService:
             PRIMARY_RETRIEVAL_LABEL,
             action,
             FALLBACK_RETRIEVAL_LABEL,
+            exc,
+        )
+
+    def _sync_search_source(self, source: str, chunks: list[KnowledgeChunk]) -> None:
+        if not self.search_store.enabled:
+            return
+        try:
+            self.search_store.replace_source(source, chunks)
+        except Exception as exc:
+            self._handle_search_error("replace_source", exc)
+
+    def _handle_search_error(self, action: str, exc: Exception) -> None:
+        self.search_store.error = f"{type(exc).__name__}: {exc}"
+        if self.search_store.required:
+            raise exc
+        # Latch the failure for this request/service instance. A newly created
+        # service will retry, while repeated bootstrap operations fall back
+        # immediately instead of waiting for the same unavailable endpoint.
+        self.search_store.client = None
+        logger.warning(
+            "OpenSearch BM25 %s failed; falling back to process-local BM25: %s",
+            action,
             exc,
         )
 
